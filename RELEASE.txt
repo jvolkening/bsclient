@@ -1,0 +1,35 @@
+bsclient
+
+Version 0.4.1a
+
+* Fixed a bug resulting in incomplete project/sample listings (set "Limit"
+    query parameter to maximum, previously set to default of 10)
+
+Version 0.3.3a
+
+* Added command-line option to turn off SSL certificate verification, based on
+    issues reporter by users on some systems (an alternative is to install
+    Mozilla::CA
+* Added command-line option to specify network connection timeout
+
+Version 0.3a
+
+* Changed implementation of password/token prompt to allow for masked input on
+    Windows systems
+* Fixed bug causing exit on empty command
+
+Version 0.2a
+
+* Switched from LWP to HTTP::Tiny, greatly reducing the CPU load during
+    downloads
+* Fixed bug that made navigation difficult to projects/sample names containing
+    spaces (now replaced with underscores)
+* Fixed bug that raised exception in certain directory navigation patterns
+* Fixed bug that affected subsequent attempts to 'get' after a 'file exists'
+    warning
+* Fixed bug that prevented file renaming in Windows
+* Fixed minor bug in POD
+
+Version 0.1a
+
+* Initial public release

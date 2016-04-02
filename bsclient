@@ -1,0 +1,709 @@
+#!/usr/bin/perl
+
+use 5.012;
+
+use strict;
+use warnings;
+
+use charnames qw/:full/;
+use Crypt::Blowfish;
+use Crypt::CBC;
+use Data::Dumper;
+use Digest::SHA qw/sha256_hex/;
+use File::HomeDir;
+use Getopt::Long;
+use HTTP::Tiny;
+use JSON;
+use List::Util qw/max/;
+use List::MoreUtils qw/any/;
+use Pod::Usage qw/pod2usage/;
+use Term::ReadKey;
+use Term::ReadLine;
+use Text::ParseWords;
+
+our $VERSION = '0.004001';
+
+use constant CLIENT_ID  => '4e88fb752bbb40f28e30ac60a19ba3e0';
+use constant PROGRAM    => 'bsclient';
+use constant URL_BASE   => 'https://api.basespace.illumina.com/v1pre3/';
+use constant KEY_FILE   => '.bsclient_token';
+use constant MAX_LIMIT  => 1024; # per API
+
+# parse command line parameters
+my $save_key      =  0;
+my $can_overwrite =  0;
+my $timeout       = 60;
+my $skip_verify   =  0;
+my $debug         =  0;
+my $debug_extra   =  0;
+
+GetOptions(
+
+    'save_token'  => \$save_key,
+    'overwrite'   => \$can_overwrite,
+    'timeout=i'   => \$timeout,
+    'skip_verify' => \$skip_verify,
+    'debug'       => \$debug,
+    'debug_extra' => \$debug_extra,
+    'help'        => sub{ pod2usage(-verbose => 2, input => \*DATA) },
+    'version'     => sub{ print 'This is ', PROGRAM, ' v', $VERSION, "\n"; exit },
+
+) or pod2usage( -verbose => 1 );
+
+$debug = 1 if ($debug_extra);
+
+# declare globals
+my $access_token;
+my ($method, $type, $id);
+my @curr_contents;
+my @auto_list = ();
+my $curr_level;
+my $parent_id;
+my %name_map;
+my %urls;
+my %types;
+my %cmds = (
+    'ls'   => \&list,
+    'cd'   => \&change,
+    'get'  => \&initialize_download,
+    'quit' => \&quit,
+);
+
+
+# get token from disk or interactively (and implicitly trust/untaint home dir)
+my ($keyfile) = ((File::HomeDir->my_home . '/' . KEY_FILE) =~ /(.+)/);
+
+if (-e $keyfile) {
+
+    my $keyfile_key =  prompt_masked('Enter password to unlock token: ');
+
+    open my $in, '<', $keyfile;
+    binmode($in);
+    my $data;
+    {
+        local $/ = undef;
+        $data = <$in>;
+    }
+    my ($sha,$enc) = ($data =~ /\A(\S+) (.+)\Z/ms);
+    die "ERROR: Corrupt token file\n" if (! defined $enc);
+    die "ERROR: Password does not match token file\n"
+        if ($sha ne sha256_hex($keyfile_key));
+    my $cipher = Crypt::CBC->new(
+        -key => $keyfile_key,
+        -cipher => 'Blowfish',
+    );
+    $access_token = check_token( $cipher->decrypt($enc) );
+
+}
+
+else {
+
+    $access_token = check_token( prompt_masked('Type/paste your access token: ') );
+
+    # If the user asked to save token, prompt for password and write to disk
+    if ($save_key) {
+
+        print "Saving password-protected token to disk\n";
+        
+        my $keyfile_key = prompt_masked('Enter a new password for token encryption: '); 
+        open my $out, '>', $keyfile;
+        binmode $out;
+        print {$out} sha256_hex($keyfile_key), ' ';
+        my $cipher = Crypt::CBC->new(
+            -key => $keyfile_key,
+            -cipher => 'Blowfish',
+        );
+        print {$out} $cipher->encrypt($access_token); 
+        close $out;
+        chmod 0400, $keyfile;
+
+        print "Encrypted token saved to disk\n";
+
+    }
+        
+}
+
+# initialize terminal session
+my $term = Term::ReadLine->new('bsfetch interactive prompt');
+my $term_attrs = $term->Attribs;
+$term_attrs->{completion_function} = \&autocomplete_list;
+$term->ornaments(0);
+
+#initialize user agent
+my $ua = HTTP::Tiny->new(
+    'agent'      => PROGRAM . '/' . $VERSION,
+    'verify_SSL' => ! $skip_verify,
+    'timeout'    => $timeout,
+);
+
+# fetch and display user summary
+my $user_data = fetch('users/current');
+
+
+# fetch and store project (root) info
+my $projects = fetch('users/current/projects');
+for my $item (@{ $projects->{Items} }) {
+    $item->{Name} =~ s/\s/_/g;
+    $types{$item->{Id}} = 'project';
+    push @curr_contents, ['project', $item->{Id}, $item->{Name}];
+    push @auto_list, $item->{Id}, $item->{Name};
+    if (defined $name_map{$item->{Name}}) {
+        $name_map{$item->{Name}} = 'bsc_ambig_9911'; #unlikely to collide with file name
+    }
+    else {
+        $name_map{$item->{Name}} = $item->{Id};
+    }
+}
+for (keys %name_map) {
+    warn "WARNING: Overlapping ID/Name ($_)\n"
+        if (defined $name_map{ $name_map{$_} });
+}
+$curr_level = 'project';
+
+
+# mainloop
+my $prompt = $user_data->{Email} . '>' // 'bs>';
+while (1) {
+    my $input = $term->readline($prompt);
+    my ($cmd,@args) = parse_line('\s+', 0, $input);
+    if (defined $cmd && defined $cmds{$cmd}) {
+        &{ $cmds{$cmd} }(@args);
+    }
+}
+exit;
+
+
+#----------------------------------------------------------------------------#
+#----------------------------------------------------------------------------#
+
+
+sub list {
+    
+    my @col_widths = ();
+    my $max_items = max( map {scalar(@{$_})} @curr_contents);
+    for (@curr_contents) {
+        for my $i (0..$max_items-1) {
+            $_->[$i] = '' if (! defined $_->[$i]);
+            my $l = length $_->[$i];
+            $col_widths[$i] = $l
+                if (! defined $col_widths[$i] || $l > $col_widths[$i]);
+        }
+    }
+    my $format = join( ' | ', map {"%-${_}s"} @col_widths ) . "\n";
+    for (@curr_contents) {
+        printf $format, @{$_};
+    }
+
+}
+
+sub change {
+
+    my $target_id = shift;
+    my $name = $target_id;
+    $target_id = $name_map{$target_id} // $target_id;
+    if ($target_id eq 'bsc_ambig_9911') {
+        warn "Ambiguous name, please use numeric ID instead\n";
+        return;
+    }
+    if ($target_id !~ /\A(?:\d+|\.\.)\Z/) {
+        warn "No such project or sample\n";
+        return;
+    }
+    if ($target_id eq '..' && $curr_level eq 'project') {
+        warn "Already at top level\n";
+        return;
+    }
+    if ($target_id ne '..' && $curr_level eq 'file') {
+        warn "Already at lowest level\n";
+        return;
+    }
+    my @suffices;
+    if ($target_id eq '..') {
+        @suffices = $curr_level eq 'file'      ? ("projects/$parent_id/samples","projects/$parent_id/appresults")
+                : $curr_level eq 'sample'    ? ("users/current/projects")
+                : return;
+    }
+    else {
+        if (! any {$_ eq $target_id} @auto_list) {
+            warn "No such $curr_level\n";
+            return;
+        }
+        @suffices = $curr_level eq 'project'   ? ("projects/$target_id/samples","projects/$target_id/appresults")
+                : $curr_level eq 'sample'    ? ("$types{$target_id}s/$target_id/files")
+                : return;
+        $parent_id = $target_id if ($curr_level eq 'project');
+    }
+
+    if ($target_id eq '..') {
+        $curr_level = $curr_level eq 'file' ? 'sample' : 'project';
+        $prompt =~ s/\/[^\/]+(?=\>)//;
+    }
+    else {
+        $curr_level = $curr_level eq 'project' ? 'sample' : 'file';
+        $prompt =~ s/(?=\>)/\/$name/;
+    }
+    @curr_contents = ();
+    %name_map = ();
+    @auto_list = ();
+
+    SUFFIX:
+    for my $suffix (@suffices) {
+        my $type;
+        if ($suffix =~ /\/([^\/]+)s$/) {
+            $type = $1;
+        }
+        die "unexpected failure to match suffix\n" if (! defined $type);
+        my $ref = fetch($suffix);
+        next SUFFIX if (! defined $ref);
+        for my $item (@{ $ref->{Items} }) {
+            $item->{Name} =~ s/\s/_/g;
+            die "FATAL: item ID collision\n"
+                if (defined $types{$item->{Id}} && $types{$item->{Id}} ne $type);
+            $types{$item->{Id}} = $type;
+            my @info = ($type, $item->{Id}, $item->{Name});
+            if ($type eq 'sample') {
+                my $lib_type = $item->{IsPairedEnd} ? 'paired-end' : 'single-end';
+                my $read_len = join('x', ($item->{Read1}, $item->{Read2}));
+                push @info, $lib_type, $read_len, $item->{NumReadsPF};
+            }
+            elsif ($type eq 'file') {
+                push @info, $item->{Size};
+            }
+            push @curr_contents, [@info];
+            push @auto_list, $item->{Id}, $item->{Name};
+            if (defined $name_map{$item->{Name}}) {
+                $name_map{$item->{Name}} = 'bsc_ambig_9911'; #unlikely to collide with file name
+            }
+            else {
+                $name_map{$item->{Name}} = $item->{Id};
+            }
+        }
+        for (keys %name_map) {
+            warn "WARNING: Overlapping ID/Name ($_)\n"
+                if (defined $name_map{ $name_map{$_} });
+        }
+    }
+
+}
+
+
+sub quit {
+
+    print "Goodbye.\n" and exit;
+
+}
+
+sub autocomplete_list {
+
+    my $prefix = $_[0];
+    return grep {$_ =~ /\A$prefix/} @auto_list;
+
+}
+
+sub initialize_download {
+
+    # this is a pass-through function used simply to strip off extra arguments
+    # and sanitize the input arguments
+    my ($id) = @_;
+    $id = $name_map{$id} // $id;
+    if ($id eq 'bsc_ambig_9911') {
+        warn "Ambiguous name, please use numeric ID instead\n";
+        return;
+    }
+    if ($id =~ /\D/) {
+        warn "No such project, sample or file\n";
+        return;
+    }
+    download( $id );
+
+}
+
+sub download {
+
+    my ($id, $type, $name, $expected_size) = @_;
+    $id = $name_map{$id} // $id;
+
+    $type = $type // $types{$id};
+
+    # get project name for directory
+    my $out_name;
+    if (! defined $out_name) {
+        if (! defined $name || ($type eq 'file' && ! defined $expected_size)) {
+            my $ref = fetch("${type}s/$id");
+            return if (! defined $ref);
+            $name = $ref->{Name};
+            $name = $ref->{Id} . '_' . $ref->{Name} if ($type ne 'file');
+            $expected_size = $ref->{Size} if ($type eq 'file');
+        }
+        $name =~ s/[^\w\.]/_/g if ($type ne 'file');
+        $out_name = $name;
+    }
+    if ($type ne 'file') {
+        if (-e $out_name && ! -d $out_name) {
+            warn "$out_name exists and is not a directory, skipping\n";
+            return;
+        }
+        mkdir $out_name if (! -e $out_name);
+        chdir $out_name;
+    }
+    elsif (-e $out_name && ! $can_overwrite) {
+        
+        # because some files (particularly AppResults) can have the same name
+        # (annoying but true!!!), prepend integer prefix as needed
+        my $i = 2;
+        my $tmp_out_name = $out_name;
+        while (-e $tmp_out_name) {
+            $tmp_out_name = $i++ . "\.$out_name";
+        }
+        $out_name = $tmp_out_name;
+
+    }
+
+    # get file list and download each
+    if ($type eq 'file') {
+        my $url = URL_BASE . "files/$id/content?Limit=" . MAX_LIMIT;
+        open my $fh_tmp, '>', $out_name . '.partial';
+        binmode $fh_tmp;
+        select($fh_tmp);
+        $| = 1;
+        select(STDOUT);
+        $| = 1;
+        my $cum_size = 0;
+        my $last_frac;
+        warn "Downloading file at $url\n" if ($debug);
+        my $response = $ua->request(
+            'GET',
+            $url,
+            {
+                headers => {
+                    'x-access-token' => $access_token,
+                },
+                data_callback => sub {
+
+                    # download handler with progress bar
+                    my ($data, $response) = @_;
+                    $cum_size += length $data;
+                    die "ERROR: returned more data than expected" if ($cum_size > $expected_size);
+                    print {$fh_tmp} $data;
+                    my $frac = int($cum_size/$expected_size*100);
+                    if (! defined $last_frac || $frac - $last_frac > 0) {
+                        print progress_bar($out_name, $frac);
+                        my $t = time;
+                        warn "$t\t$out_name\t$frac\n" if ($debug);
+                        $last_frac = $frac;
+                    }
+
+                },
+            },
+
+        );
+        print "\n";
+        $| = 0;
+        close $fh_tmp;
+                
+        if (! $response->{success}) {
+            unlink "$out_name.partial";
+            my $error   = $response->{reason};
+            my $content = $response->{content};
+            chomp $content;
+            my $msg = "ERROR, transfer failed: $error\n------\n$content\n";
+            if ($msg =~ /(?:certificate verify failed|Couldn't find a CA)/) {
+                $msg .= "------\nThe above error indicates that the client was"
+                . " unable to find the correct CA certificate on your local"
+                . " machine to validate the secure connection. Installing the"
+                . " Mozilla::CA module might help - otherwise use the"
+                . " '--skip_verify' flag when starting bsclient to turn off"
+                . " certificate verification\n";
+            }
+            die $msg;
+        }
+        if ((-s "$out_name.partial") == $expected_size) {
+            rename "$out_name.partial" => $out_name
+                or die "Error renaming file: $!\n";
+        }
+        else {
+            my $obs = -s "$out_name.partial";
+            unlink "$out_name.partial";
+            die "ERROR: file size mismatch (expected $expected_size, observed $obs)";
+        }
+        $out_name = undef;
+    }
+
+    else {
+        my @suffices = $type eq 'project'   ? ("projects/$id/samples","projects/$id/appresults")
+                     : $type eq 'sample'    ? ("samples/$id/files")
+                     : $type eq 'appresult' ? ("appresults/$id/files")
+                     : die "bad type $type";
+
+        SUFFIX:
+        for my $suffix (@suffices) {
+
+            my $next;
+            if ($suffix =~ /\/([^\/]+)s$/) {
+                $next = $1;
+            }
+            die "unexpected failure to match suffix\n" if (! defined $next);
+
+            my $ref = fetch($suffix);
+            next SUFFIX if (! defined $ref);
+            $out_name = undef;
+            for my $item (@{ $ref->{Items} }) {
+                my $size = $type eq 'sample' ? $item->{Size}
+                         : $type eq 'appresult' ? $item->{Size}
+                         : undef;
+                my $name = $next eq 'file' ? $item->{Name}
+                         : $item->{Id} . '_' . $item->{Name};
+                download( $item->{Id}, $next, $name, $size );
+            }
+
+        }
+        chdir '..';
+    }
+
+}
+
+sub progress_bar {
+
+    my ( $name, $frac, $width, $char ) = @_;
+    $width = $width // 25;
+    $char  = $char  // '=';
+    return sprintf "|%-${width}s| Downloading %s (%.0f%%)\r", 
+        $char x (($width-1)*$frac/100). '>', 
+        $name, $frac;
+
+}
+
+sub check_token {
+
+    my $token = shift;
+    if ($token =~ /\A([0-9a-fA-F]{16,64})\Z/) {
+        return $1;
+    }
+    else {
+        die "ERROR: Bad access token provided\n";
+    }
+
+}
+
+sub fetch {
+
+    my $suffix = shift;
+    my $url = URL_BASE . $suffix . '?Limit=' . MAX_LIMIT;
+    warn "fetching metadata from $url\n" if ($debug);
+    my $response = $ua->request(
+        'GET',
+        $url,
+        {
+            headers => {
+                'x-access-token' => $access_token,
+            },
+        }
+    );
+    if ($response->{success}) {
+        my $content = $response->{content};
+        my $ref = decode_json $content;
+        warn Dumper $ref if ($debug_extra);
+        return $ref->{Response};
+    }
+    else {
+        my $error   = $response->{reason};
+        my $content = $response->{content};
+        chomp $content;
+        my $msg = "ERROR, transfer failed: $error\n------\n$content\n";
+        if ($msg =~ /(?:certificate verify failed|Couldn't find a CA)/) {
+            $msg .= "------\nThe above error indicates that the client was"
+            . " unable to find the correct CA certificate on your local"
+            . " machine to validate the secure connection. Installing the"
+            . " Mozilla::CA module might help - otherwise use the"
+            . " '--skip_verify' flag when starting bsclient to turn off"
+            . " certificate verification\n";
+        }
+        die $msg;
+        return undef;
+    }
+
+}
+
+sub prompt_masked {
+
+    my ($prompt) = @_;
+
+    local $| = 1;
+    print $prompt;
+    ReadMode(3);
+    my $input;
+
+    READ:
+    while(1) {
+        my $key = ReadKey(0);
+        last READ if ($key eq "\N{CR}" || $key eq "\N{LF}");
+        next READ if (ord($key) < 32);
+        if($key eq "\N{BS}" || $key eq "\N{DEL}") {
+            next READ if (length($input) < 1);
+            chop($input) and print "\b \b";
+            next READ;
+        }
+        $input .= $key and print '*';
+    }
+    ReadMode(0); #Reset the terminal once we are done
+    print "\n";
+    return $input;
+
+}
+
+
+__END__
+
+=head1 NAME
+
+bsclient - simple interactive FTP-like client for BaseSpace data downloads
+
+=head1 SYNOPSIS
+
+bsclient [options] 
+
+=head1 DESCRIPTION
+
+B<bsclient> is a simple interactive shell for Illumina BaseSpace
+files/resources.  It supports a limited set of FTP-like commands for
+navigating and downloading files from a BaseSpace account. The user account
+and privileges are encoded in an 'access token' which must be obtained from
+the BaseSpace Developers site (see AUTHENTICATION). B<bsclient> treats
+BaseSpace data "levels" as pseudo-directories in order to provide an FTP-like
+experience. See COMMANDS for further details.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--overwrite>
+
+Force overwrite of existing files. Default is false (existing files are
+skipped).
+
+=item B<--save_token>
+
+Attempt to save encrypted access token to file. This is only honored if an
+existing .bsclient_token file is not found and the user has been prompted for
+the access token. User will be prompted for an encryption key which is used
+for subsequent sessions (easier than remembering a 32-character hex string!).
+
+=item B<--timeout>
+
+Set the network timeout in seconds (default: 60). Increase this value if
+downloads are failing mid-way through.
+
+=item B<--skip_verify>
+
+Skip verification of the SSL certificate validity. This does not disable
+encryption on the connection, but simply turns off the requirement that the
+certificate be matched against the database stored on the computer. Some users
+may need to set this flag if receiving errors about failed SSL connections.
+
+=item B<--help>
+
+Show documentation and exit
+
+=item B<--version>
+
+Print version string and exit
+
+=back
+
+=head1 AUTHENTICATION
+
+Authentication with BaseSpace is done via tokens. Therefore, in order to
+obtain full access to your BaseSpace account using this tool, you will need to
+obtain an access token with global rights to your account. Currently, this can
+only be done by signing up for a BaseSpace developer's account (free and easy
+to do). Perhaps in the future BaseSpace will allow creation of tokens with
+global read-only permissions for regular users, but this is currently not
+possible to my knowledge. This token can grant full access to your account for
+anyone who discovers it, so treat it like you would any other important
+password or passphrase.
+
+Once you have obtained an access token (a long hexidecimal string) you can use
+it with B<bsclient> to connect to your account. If B<bsclient> does not find any
+stored tokens, it will prompt you to enter your access token when started. It will
+not, by default, store this token to disk in order to prevent access to the
+token from others on a public or shared machine. If you are on a private,
+secure computer and want to store the token to disk for future use, specify
+the '--save_token' flag on the command line. In this case, B<bsclient> will
+ask for a separate passphrase to use for symmetric encryption of the access
+token before writing it to your home directory. This prevents casual discovery
+of the token should anyone gain access to your home files, with the advantage
+that is is probably easier to remember a passphrase of your choosing than a
+32-character hexadecimal string. If your access token should change for any
+reason, simply delete the file at $HOME/.bsclient_token and repeat the above
+procedure.
+
+=head1 COMMANDS
+
+=over 8
+
+=item B<ls>
+
+List items in current level. Information displayed is pipe-separated and
+varies depending on the current level, as follows:
+
+Projects:
+project | <ID> | <Name>
+
+Samples:
+sample | <ID> | <Name> | <library_type> | <read_lens> | <passed_read_count>
+
+Files:
+file | <ID> | <Name> | <size_in_bytes>
+
+=item B<cd> I<target>
+
+Change level. Currently there is a three-level hierarchy:
+Projects->Samples->Files. Works with tab-autocompletion (either by ID or
+name), and '..' goes up one level as expected. Currently, only a single level
+change is supported per command (e.g.  '../..' will not work).
+
+=item B<get> I<target>
+
+Download file(s). If a file name/ID is given, will download a single file. If
+a sample or project name/ID is given, will recursively download all files in
+that sample/project within a corresponding directory structure. If a file
+exists and '--overwrite' was not specified, it will be skipped. 
+
+=item B<quit>
+
+Self-explanatory
+
+=back
+
+=head1 CAVEATS AND BUGS
+
+This software has been tested on Linux and, to a lesser extent, on Windows
+8.1. While it should also work on Mac OSX, BSD, and other systems with the
+appropriate modules installed, it has not been tested on these systems.  Input
+from users on these systems would be appreciated.
+
+Please report all bugs or suggestions by email to the author below.
+
+=head1 AUTHOR
+
+Jeremy Volkening
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright 2014-2015 Jeremy Volkening <jeremy@base2bio.com>
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
+
