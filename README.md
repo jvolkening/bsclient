@@ -24,10 +24,19 @@ other systems - feedback from these users is appreciated.
 
 ## INSTALLATION
 
-The program is a monolithic script. On Linux, installation should be as simple as
-installing the necessary dependencies, copying the script to an appropriate
-location and making it executable. Further details are left as an exercise for
-the reader.
+The program is a monolithic script. On Linux, installation can be as simple as
+installing the necessary dependencies, copying the `bsclient` script to an appropriate
+location and making it executable. However, a Perl-ish install environment is
+also provided which can be used thus:
+
+```
+git clone https://github.com/jvolkening/bsclient
+cd bsclient
+perl Makefile.PL
+make
+make install
+make clean
+```
 
 ### Dependencies
 
