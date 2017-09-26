@@ -29,7 +29,7 @@ installing the necessary dependencies, copying the `bsclient` script to an appro
 location and making it executable. However, a Perl-ish install environment is
 also provided which can be used thus:
 
-```
+```sh
 git clone https://github.com/jvolkening/bsclient
 cd bsclient
 perl Makefile.PL
